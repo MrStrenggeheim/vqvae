@@ -1,102 +1,189 @@
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
 import argparse
-import utils
+import os
+import random
+import time
+from collections import deque
+
+import numpy as np
+import pytorch_lightning as pl
+import torch
+import torch.nn.functional as F
+import torchvision.utils as vutils
+import yaml
 from models.vqvae import VQVAE
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger
+from torchsummary import summary
 
-parser = argparse.ArgumentParser()
-
-"""
-Hyperparameters
-"""
-timestamp = utils.readable_timestamp()
-
-parser.add_argument("--batch_size", type=int, default=32)
-parser.add_argument("--n_updates", type=int, default=5000)
-parser.add_argument("--n_hiddens", type=int, default=128)
-parser.add_argument("--n_residual_hiddens", type=int, default=32)
-parser.add_argument("--n_residual_layers", type=int, default=2)
-parser.add_argument("--embedding_dim", type=int, default=64)
-parser.add_argument("--n_embeddings", type=int, default=512)
-parser.add_argument("--beta", type=float, default=.25)
-parser.add_argument("--learning_rate", type=float, default=3e-4)
-parser.add_argument("--log_interval", type=int, default=50)
-parser.add_argument("--dataset",  type=str, default='CIFAR10')
-
-# whether or not to save model
-parser.add_argument("-save", action="store_true")
-parser.add_argument("--filename",  type=str, default=timestamp)
-
-args = parser.parse_args()
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-if args.save:
-    print('Results will be saved in ./results/vqvae_' + args.filename + '.pth')
-
-"""
-Load data and define batch data loaders
-"""
-
-training_data, validation_data, training_loader, validation_loader, x_train_var = utils.load_data_and_data_loaders(
-    args.dataset, args.batch_size)
-"""
-Set up VQ-VAE model with components defined in ./models/ folder
-"""
-
-model = VQVAE(args.n_hiddens, args.n_residual_hiddens,
-              args.n_residual_layers, args.n_embeddings, args.embedding_dim, args.beta).to(device)
-
-"""
-Set up optimizer and training loop
-"""
-optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, amsgrad=True)
-
-model.train()
-
-results = {
-    'n_updates': 0,
-    'recon_errors': [],
-    'loss_vals': [],
-    'perplexities': [],
-}
+from utils.utils import load_amos
 
 
-def train():
+# Define PyTorch Lightning Module
+class VQVAETrainingModule(pl.LightningModule):
+    def __init__(self, config):
+        super(VQVAETrainingModule, self).__init__()
+        self.save_hyperparameters(config)
+        self.model = VQVAE(
+            config["model"]["n_channel"],
+            config["model"]["n_hiddens"],
+            config["model"]["n_residual_hiddens"],
+            config["model"]["n_residual_layers"],
+            config["model"]["n_embeddings"],
+            config["model"]["embedding_dim"],
+            config["model"]["beta"],
+        )
+        self.losses: dict[str, deque] = {}
+        self.train_on = "label" if config["dataset"]["train_on_labels"] else "image"
 
-    for i in range(args.n_updates):
-        (x, _) = next(iter(training_loader))
-        x = x.to(device)
-        optimizer.zero_grad()
+        summary(self.model, (config["model"]["n_channel"], 512, 512))
 
-        embedding_loss, x_hat, perplexity = model(x)
-        recon_loss = torch.mean((x_hat - x)**2) / x_train_var
+    def forward(self, x):
+        return self.model(x)
+
+    def training_step(self, batch, batch_idx):
+        x = batch[self.train_on]
+        embedding_loss, x_hat, perplexity = self.model(x)
+        recon_loss = F.mse_loss(x_hat, x)
         loss = recon_loss + embedding_loss
 
-        loss.backward()
-        optimizer.step()
+        # Track losses
+        train_loss = {"loss": loss, "recon_loss": recon_loss, "perplexity": perplexity}
+        for key, val in train_loss.items():
+            if key not in self.losses:
+                self.losses[key] = deque(maxlen=300)
+            self.losses[key].append(val.item())
 
-        results["recon_errors"].append(recon_loss.cpu().detach().numpy())
-        results["perplexities"].append(perplexity.cpu().detach().numpy())
-        results["loss_vals"].append(loss.cpu().detach().numpy())
-        results["n_updates"] = i
+        # Log metrics
+        self.log_dict(
+            {key: sum(val) / len(val) for key, val in self.losses.items()},
+            sync_dist=True,
+            prog_bar=True,
+        )
 
-        if i % args.log_interval == 0:
-            """
-            save model and print values
-            """
-            if args.save:
-                hyperparameters = args.__dict__
-                utils.save_model_and_results(
-                    model, results, hyperparameters, args.filename)
+        return loss
 
-            print('Update #', i, 'Recon Error:',
-                  np.mean(results["recon_errors"][-args.log_interval:]),
-                  'Loss', np.mean(results["loss_vals"][-args.log_interval:]),
-                  'Perplexity:', np.mean(results["perplexities"][-args.log_interval:]))
+    def on_train_epoch_end(self):
+        pass  # No need to log reconstructions here, it is handled in validation
+
+    def validation_step(self, batch, batch_idx):
+        x = batch[self.train_on]
+        embedding_loss, x_hat, perplexity = self.model(x)
+        recon_loss = F.mse_loss(x_hat, x)
+        loss = recon_loss + embedding_loss
+
+        # Log validation metrics
+        val_loss = {
+            "val_loss": loss,
+            "val_recon_loss": recon_loss,
+            "val_perplexity": perplexity,
+        }
+        self.log_dict(
+            {f"{key}": val.item() for key, val in val_loss.items()},
+            sync_dist=True,
+            prog_bar=True,
+        )
+
+        # Log reconstruction images to TensorBoard after each validation
+        if batch_idx == 0:  # Log only the first batch
+            exp = self.logger.experiment
+            exp.add_image(
+                "Validation_Reconstruction",
+                self.reconstruct_images(batch),
+                self.current_epoch,
+            )
+
+        return loss
+
+    def reconstruct_images(self, batch):
+        # Get sample reconstruction images
+        x = batch[self.train_on]
+        x = x.to(self.device)
+        _, x_hat, _ = self.model(x)
+        grid = vutils.make_grid(torch.cat([x[:8], x_hat[:8]]), nrow=8, normalize=True)
+        return grid
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(
+            self.model.parameters(),
+            lr=self.hparams["training"]["learning_rate"],
+            amsgrad=True,
+        )
 
 
+# Train the model
 if __name__ == "__main__":
-    train()
+    # add_argument
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="config.yaml")
+    parser.add_argument("--resume", type=str, default=None)
+    args = parser.parse_args()
+
+    # Load configuration from YAML
+    CONFIG_PATH = os.getcwd() + "/" + args.config
+    with open(CONFIG_PATH, "r") as f:
+        config = yaml.safe_load(f)
+
+    # set seed
+    seed = config["training"]["seed"]
+    pl.seed_everything(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+
+    # Load data using utility function
+    training_data, validation_data, training_loader, validation_loader = load_amos(
+        config["dataset"]
+    )
+
+    logger = TensorBoardLogger(
+        config["logging"]["log_dir"], name=config["logging"]["experiment_name"]
+    )
+    logger.log_hyperparams(config)
+
+    # Set up PyTorch Lightning Trainer with Early Stopping and Model Checkpointing
+    checkpoint_callback = ModelCheckpoint(
+        monitor="val_loss",
+        mode="min",
+        filename=f"{config['logging']['experiment_name']}-{logger.version}"
+        + "-{epoch:02d}-{val_loss:.6f}",
+        save_top_k=2,
+        save_last=True,
+    )
+
+    early_stopping_callback = EarlyStopping(
+        monitor="val_loss",
+        mode="min",
+        patience=config["training"]["early_stopping_patience"],
+    )
+
+    trainer = pl.Trainer(
+        max_epochs=config["training"]["max_epochs"],
+        callbacks=[
+            checkpoint_callback,
+            # early_stopping_callback
+        ],
+        log_every_n_steps=config["logging"]["log_interval"],
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        devices=1,  # if torch.cuda.is_available() else None,
+        logger=logger,
+        val_check_interval=config["training"]["validation_interval"],
+        fast_dev_run=False,
+    )
+
+    print(f"Using device {"gpu" if torch.cuda.is_available() else "cpu"}")
+
+    vqvae_module = VQVAETrainingModule(config)
+
+    if args.resume:
+        print(f"Resuming training from {args.resume}")
+        trainer.fit(
+            vqvae_module,
+            training_loader,
+            validation_loader,
+            ckpt_path=args.resume,
+        )
+    else:
+        print("Starting new training run")
+        trainer.fit(vqvae_module, training_loader, validation_loader)

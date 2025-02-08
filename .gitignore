@@ -1,3 +1,6 @@
+runs/
+*.err
+*.out
 data/
 __pycache__
 .vscode/
